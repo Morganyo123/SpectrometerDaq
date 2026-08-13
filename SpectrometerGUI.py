@@ -15,7 +15,7 @@ from PyQt6.QtCore import QTimer, Qt
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget,
                              QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
                              QPlainTextEdit, QGridLayout, QSizePolicy, QLineEdit,
-                             QInputDialog)
+                             QInputDialog,QMessageBox)
 
 classes = ['logs', 'livePlotter', 'PiSerial', 'specGUI']
 
@@ -128,7 +128,7 @@ class livePlotter(FigureCanvasQTAgg):
 
 
 class PiSerial():
-    def __init__(self, port="COM4", baud=115200, logger=print, autostart=True,desired_start_gain=30):
+    def __init__(self, port="COM4", baud=115200, logger=print, autostart=True,default_start_gain=30):
         self.CODE_TO_DTYPE = {
                                 1: np.uint8,
                                 2: np.int16,
@@ -136,7 +136,7 @@ class PiSerial():
                                 4: np.float32,
                                 5: np.float64,
                             }
-        #self.desired_start_gain = desired_start_gain
+        #self.default_start_gain = default_start_gain
         self.READY_TOKEN  = 'waiting for startup configuration'
         self.ACK_TOKENS   = ['startup gain set to', 'ack']
         self.STREAM_TOKEN = 'starting continuous stream'
@@ -157,26 +157,33 @@ class PiSerial():
         self.log = logger        # GUI passes log_box.add_message here
 
         if autostart:
-            self.connect(desired_start_gain)
+            self.connect(default_start_gain)
 
-    def connect(self, desired_start_gain):
+    def connect(self, default_start_gain):
         """Get the Pi streaming. Was the body of __init__ - split out so the GUI
         can run it after the window is up and route the prints to the log box."""
         self.log("Checking for existing data stream...")
         if self.stream_detected(seconds=3):
-            self.log("Data already streaming from the Pi - skipping handshake.")
+            self.log("Data already streaming from the Pi - skipping handshake. ")
+            
             return True
 
         self.log("No live stream - checking console state...")
-        if self.sender_already_running(desired_start_gain):
+
+        user_start_gain = window.gain_popup()
+
+        if user_start_gain is not None:
+            default_start_gain = user_start_gain
+        
+        if self.sender_already_running(default_start_gain):
             self.log("Sender was already up - configured it.")
             if self.stream_detected(seconds=5):
                 return True
             self.log("No bytes after configuring - running full handshake...")
-            return self.bring_up_pi(desired_start_gain=desired_start_gain)
+            return self.bring_up_pi(default_start_gain=default_start_gain)
 
         self.log("Running full handshake...")
-        return self.bring_up_pi(desired_start_gain=desired_start_gain)
+        return self.bring_up_pi(default_start_gain=default_start_gain)
 
     def open_data(self):
         self.ser = serial.Serial(self.PORT, self.BAUD, timeout=2)
@@ -285,6 +292,7 @@ class PiSerial():
         if console.in_waiting:
             console.read(console.in_waiting)
 
+
         cmd = f"START_GAIN:{gain}\n"
         console.write(cmd.encode())
 
@@ -313,7 +321,7 @@ class PiSerial():
         self.log("Warning: stream banner not seen - will probe for bytes anyway.")
         return False
 
-    def sender_already_running(self, desired_start_gain=30.0):
+    def sender_already_running(self, default_start_gain=30.0):
         """Sender already up but unconfigured (console blank / at READY banner).
         Classifies FIRST so it never types a gain at a login or shell prompt."""
         try:
@@ -325,7 +333,7 @@ class PiSerial():
                 if state not in ('sender_ready', 'blank'):
                     self.log(f"Console is at '{state}' - needs a login, not a gain.")
                     return False
-                if self.send_gain(console, desired_start_gain):
+                if self.send_gain(console, default_start_gain):
                     self.wait_for_stream_banner(console, timeout=40)
                     return True
                 return False
@@ -384,7 +392,7 @@ class PiSerial():
             time.sleep(15)
         return True
 
-    def bring_up_pi(self, desired_start_gain=30.0, max_attempts=None):
+    def bring_up_pi(self, default_start_gain=30.0, max_attempts=None):
         attempt = 0
         while True:
             attempt += 1
@@ -406,12 +414,12 @@ class PiSerial():
                         streaming = True
                     elif state in ('sender_ready', 'blank'):
                         # Sender owns the console and is waiting for its config
-                        gained = self.send_gain(console, desired_start_gain)
+                        gained = self.send_gain(console, default_start_gain)
                     else:
                         ok = self.login_and_launch(console, state)
                         if ok is False:
                             raise RuntimeError("login_and_launch failed")
-                        gained = self.send_gain(console, desired_start_gain)
+                        gained = self.send_gain(console, default_start_gain)
 
                     if gained:
                         # Covers Picamera2 init before we let go of the port
@@ -490,14 +498,14 @@ class PiSerial():
 
 class specGUI(QMainWindow):
     def __init__(self, port='COM4', rep_rate=10, testing=False,
-                 cal_file="calData.csv", desired_start_gain=30.0):
+                 cal_file="calData.csv", default_start_gain=30.0):
         super().__init__()
         self.setWindowTitle("Spectrometer Serial")
         self.resize(1500, 800)
         self.rep_rate = rep_rate
         self.testing = testing
         self.cal_file = cal_file
-        self.desired_start_gain = desired_start_gain
+        self.default_start_gain = default_start_gain
         self.pfind_state = False
         self.smooth_state = True
         self.calibrating = False
@@ -517,7 +525,7 @@ class specGUI(QMainWindow):
             self.start_btn.setEnabled(True)
         else:
             self.pi = PiSerial(port=port, logger=self.log_box.add_message,
-                               autostart=False, desired_start_gain=desired_start_gain)
+                               autostart=False, default_start_gain=default_start_gain)
             check = self.read_data
             # Handshake after the window is painted, so the log is visible
             QTimer.singleShot(100, self.connect_pi)
@@ -606,6 +614,20 @@ class specGUI(QMainWindow):
         self.log_box.setFixedWidth(280)
         layout.addWidget(self.log_box, 0, 4, 4, 1)
 
+    def gain_popup(self):
+        """Prompt user to enter picam gain"""
+        gain, ok = QInputDialog.getInt(
+                            self, "Enter Gain", " 1-50")
+        if not ok:
+            return None
+
+        #clamp to allowed values
+        gain = max(1,gain)
+        gain = min(50,gain)
+
+        return gain
+    
+
     def load_calibration(self, path, width=800):
         """Fit a wavelength axis from calibration points (pixel,wavelength CSV,
         as written by on_click). 3 points -> 2nd order fit, >3 -> 3rd order
@@ -639,7 +661,7 @@ class specGUI(QMainWindow):
         self.status_label.setText("Status: connecting...")
         self.log_box.add_message("Bringing up the Pi...")
         try:
-            ok = self.pi.connect(desired_start_gain=self.desired_start_gain)
+            ok = self.pi.connect(default_start_gain=self.default_start_gain)
         except Exception as e:
             ok = False
             self.log_box.add_message(f"Handshake error: {e}")
@@ -823,6 +845,6 @@ class specGUI(QMainWindow):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    window = specGUI(port='COM4', rep_rate=10, testing=False,desired_start_gain=40.0)
+    window = specGUI(port='COM4', rep_rate=10, testing=False,default_start_gain=40.0)
     window.show()
     sys.exit(app.exec())
