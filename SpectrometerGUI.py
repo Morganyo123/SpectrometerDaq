@@ -11,7 +11,7 @@ from datetime import datetime
 from scipy.signal import find_peaks, savgol_filter
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
-from PyQt6.QtCore import QTimer, Qt
+from PyQt6.QtCore import QTimer, Qt, QObject, QThread, pyqtSignal, QMutex, QWaitCondition
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget,
                              QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
                              QPlainTextEdit, QGridLayout, QSizePolicy, QLineEdit,
@@ -128,7 +128,8 @@ class livePlotter(FigureCanvasQTAgg):
 
 
 class PiSerial():
-    def __init__(self, port="COM4", baud=115200, logger=print, autostart=True,default_start_gain=30):
+    def __init__(self, port="COM4", baud=115200, logger=print, autostart=True,
+                 default_start_gain=30, gain_prompt=None):
         self.CODE_TO_DTYPE = {
                                 1: np.uint8,
                                 2: np.int16,
@@ -156,6 +157,9 @@ class PiSerial():
         self.ser = None          # no data connection open yet
         self.log = logger        # GUI passes log_box.add_message here
 
+        
+        self.gain_prompt = gain_prompt or (lambda: None)
+
         if autostart:
             self.connect(default_start_gain)
 
@@ -170,7 +174,7 @@ class PiSerial():
 
         self.log("No live stream - checking console state...")
 
-        user_start_gain = window.gain_popup()
+        user_start_gain = self.gain_prompt()
 
         if user_start_gain is not None:
             default_start_gain = user_start_gain
@@ -496,6 +500,56 @@ class PiSerial():
 
 
 
+class PiWorker(QObject):
+    """Runs PiSerial.connect() (the blocking handshake) off the GUI thread.
+
+    Anything that touches widgets (logging, the gain dialog) is routed back
+    to the main thread via signals instead of being called directly, since
+    Qt widgets are not thread-safe.
+    """
+    log = pyqtSignal(str)
+    gain_requested = pyqtSignal()   # ask the main thread to show the dialog
+    finished = pyqtSignal(bool)     # handshake success/failure
+
+    def __init__(self, pi, default_start_gain):
+        super().__init__()
+        self.pi = pi
+        self.default_start_gain = default_start_gain
+        self._gain_result = None
+        self._mutex = QMutex()
+        self._wait = QWaitCondition()
+
+        # Route PiSerial's logging/gain-prompt calls through this worker's
+        # signals instead of print()/a direct widget call.
+        self.pi.log = self.log.emit
+        self.pi.gain_prompt = self.ask_gain
+
+    def run(self):
+        try:
+            ok = self.pi.connect(default_start_gain=self.default_start_gain)
+        except Exception as e:
+            self.log.emit(f"Handshake error: {e}")
+            ok = False
+        self.finished.emit(ok)
+
+    def ask_gain(self):
+        """Called on the worker thread. Blocks until provide_gain() is
+        called back on the main thread with the dialog's result."""
+        self._mutex.lock()
+        self.gain_requested.emit()
+        self._wait.wait(self._mutex)
+        result = self._gain_result
+        self._mutex.unlock()
+        return result
+
+    def provide_gain(self, value):
+        """Called on the main thread once the gain dialog has closed."""
+        self._mutex.lock()
+        self._gain_result = value
+        self._wait.wakeAll()
+        self._mutex.unlock()
+
+
 class specGUI(QMainWindow):
     def __init__(self, port='COM4', rep_rate=10, testing=False,
                  cal_file="calData.csv", default_start_gain=30.0):
@@ -517,6 +571,9 @@ class specGUI(QMainWindow):
         self.status_msg = 'Testing' if testing else 'Not connected'
         self.init_ui()
         self.load_calibration(self.cal_file)
+
+        self.pi_thread = None
+        self.pi_worker = None
 
         if testing:
             self.pi = None
@@ -658,14 +715,33 @@ class specGUI(QMainWindow):
                 f"Calibrated: 3 points, 2nd order fit (add more points for accuracy)")
 
     def connect_pi(self):
+        if self.pi_thread is not None and self.pi_thread.isRunning():
+            return  # a handshake is already in flight
+
         self.status_label.setText("Status: connecting...")
         self.log_box.add_message("Bringing up the Pi...")
-        try:
-            ok = self.pi.connect(default_start_gain=self.default_start_gain)
-        except Exception as e:
-            ok = False
-            self.log_box.add_message(f"Handshake error: {e}")
+        self.start_btn.setEnabled(False)
 
+        self.pi_thread = QThread()
+        self.pi_worker = PiWorker(self.pi, self.default_start_gain)
+        self.pi_worker.moveToThread(self.pi_thread)
+
+        self.pi_thread.started.connect(self.pi_worker.run)
+        self.pi_worker.log.connect(self.log_box.add_message)
+        self.pi_worker.gain_requested.connect(self._show_gain_dialog)
+        self.pi_worker.finished.connect(self._on_connect_finished)
+        self.pi_worker.finished.connect(self.pi_thread.quit)
+        self.pi_thread.finished.connect(self.pi_worker.deleteLater)
+        self.pi_thread.finished.connect(self.pi_thread.deleteLater)
+
+        self.pi_thread.start()
+
+    def _show_gain_dialog(self):
+        """Runs on the main thread in response to PiWorker.gain_requested."""
+        gain = self.gain_popup()
+        self.pi_worker.provide_gain(gain)
+
+    def _on_connect_finished(self, ok):
         if ok:
             self.status_label.setText("Status: Pi streaming - press Start Reading")
             self.status_label.setStyleSheet("color: green; font-size: 14px;")
@@ -838,6 +914,9 @@ class specGUI(QMainWindow):
     def closeEvent(self, event):
         if self.serial_timer.isActive():
             self.serial_timer.stop()
+        if self.pi_thread is not None and self.pi_thread.isRunning():
+            self.pi_thread.quit()
+            self.pi_thread.wait(3000)
         if self.pi is not None:
             self.pi.close_data()
         event.accept()
