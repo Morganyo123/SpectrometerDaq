@@ -15,7 +15,7 @@ from PyQt6.QtCore import QTimer, Qt, QObject, QThread, pyqtSignal, QMutex, QWait
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget,
                              QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
                              QPlainTextEdit, QGridLayout, QSizePolicy, QLineEdit,
-                             QInputDialog,QMessageBox)
+                             QInputDialog, QMessageBox, QGroupBox)
 
 classes = ['logs', 'livePlotter', 'PiSerial', 'specGUI']
 
@@ -83,6 +83,7 @@ class livePlotter(FigureCanvasQTAgg):
 
         self._width = 50
         self._mindist = 50
+        self._height = 10
 
         self.x = []
         self.y = []
@@ -119,7 +120,7 @@ class livePlotter(FigureCanvasQTAgg):
         self.draw()
 
     def peakFinder(self):
-        peaks, _ = find_peaks(self.y, distance=self._mindist, width=self._width,height=10)
+        peaks, _ = find_peaks(self.y, distance=self._mindist, width=self._width, height=self._height)
         self.p.set_data(self.x[peaks], self.y[peaks])
         for peak in peaks:
             self.ax.annotate(f'{self.x[peak]:.1f} nm', xy=(self.x[peak], self.y[peak]), xytext=(self.x[peak], self.y[peak]+5),
@@ -157,7 +158,9 @@ class PiSerial():
         self.ser = None          # no data connection open yet
         self.log = logger        # GUI passes log_box.add_message here
 
-        
+        # Callable that returns a gain value (or None). Defaults to "no prompt"
+        # so PiSerial never has to know how the GUI shows a dialog, and never
+        # reaches for a global. The GUI/worker wires this up before connect().
         self.gain_prompt = gain_prompt or (lambda: None)
 
         if autostart:
@@ -555,7 +558,7 @@ class specGUI(QMainWindow):
                  cal_file="calData.csv", default_start_gain=30.0):
         super().__init__()
         self.setWindowTitle("Spectrometer Serial")
-        self.resize(1500, 800)
+        self._set_initial_size()
         self.rep_rate = rep_rate
         self.testing = testing
         self.cal_file = cal_file
@@ -591,6 +594,19 @@ class specGUI(QMainWindow):
         self.live_plotter.fig.canvas.mpl_connect('button_press_event', self.on_click)
         self.serial_timer = QTimer()
         self.serial_timer.timeout.connect(check)
+
+    def _set_initial_size(self):
+        """Size the window to fit the actual screen instead of a hardcoded
+        1500x800, which can be bigger than the available desktop (e.g. on a
+        laptop display or when scaled by DPI)."""
+        target_w, target_h = 1500, 800
+        screen = QApplication.primaryScreen()
+        if screen is not None:
+            avail = screen.availableGeometry()
+            target_w = min(target_w, int(avail.width() * 0.9))
+            target_h = min(target_h, int(avail.height() * 0.9))
+        self.setMinimumSize(900, 600)   # keep the layout usable if shrunk
+        self.resize(target_w, target_h)
 
     def init_ui(self):
         central_widget = QWidget()
@@ -643,24 +659,52 @@ class specGUI(QMainWindow):
         self.save_btn.clicked.connect(self.save_data)
         btn_layout.addWidget(self.save_btn)
 
-        layout.addLayout(btn_layout, 4, 0)
+        layout.addLayout(btn_layout, 4, 0, 1, 4)
 
 
         self.live_plotter = livePlotter(self)
         self.live_plotter.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.live_plotter.setMinimumSize(200, 150)   # let it shrink instead of forcing a big min size
         layout.addWidget(self.live_plotter, 1, 0, 2, 4)
 
         self.width_box = QLineEdit()
         self.width_box.setPlaceholderText(f"Width is {self.live_plotter._width}")
-        self.width_box.setFixedWidth(150)
+        self.width_box.setMinimumWidth(120)
         self.width_box.returnPressed.connect(self.handle_width)
-        layout.addWidget(self.width_box, 3, 1)
 
         self.mindist_box = QLineEdit()
         self.mindist_box.setPlaceholderText(f"MinDist is {self.live_plotter._mindist}")
-        self.mindist_box.setFixedWidth(150)
+        self.mindist_box.setMinimumWidth(120)
         self.mindist_box.returnPressed.connect(self.handle_mindist)
-        layout.addWidget(self.mindist_box, 3, 2)
+
+        self.height_box = QLineEdit()
+        self.height_box.setPlaceholderText(f"Height is {self.live_plotter._height}")
+        self.height_box.setMinimumWidth(120)
+        self.height_box.returnPressed.connect(self.handle_height)
+
+        peak_settings_box = QGroupBox("Peak Finder Settings")
+        peak_settings_box.setStyleSheet("""
+            QGroupBox {
+                color: #cccccc;
+                border: 1px solid #555;
+                border-radius: 4px;
+                margin-top: 6px;
+                font-size: 11px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 8px;
+                padding: 0 4px;
+            }
+        """)
+        peak_settings_layout = QHBoxLayout(peak_settings_box)
+        peak_settings_layout.setContentsMargins(8, 4, 8, 4)
+        peak_settings_layout.addWidget(self.width_box)
+        peak_settings_layout.addWidget(self.mindist_box)
+        peak_settings_layout.addWidget(self.height_box)
+        layout.addWidget(peak_settings_box, 3, 1, 1, 2)
+        self.peak_settings_box = peak_settings_box
+        self.peak_settings_box.setVisible(self.pfind_state)   # hidden until peak finder is enabled
 
         self.cursor_pos = QLabel("")
         self.cursor_pos.setStyleSheet("font-weight: bold; font-size: 18px;")
@@ -669,7 +713,23 @@ class specGUI(QMainWindow):
 
         self.log_box = logs(title='Logs')
         self.log_box.setFixedWidth(280)
-        layout.addWidget(self.log_box, 0, 4, 4, 1)
+        layout.addWidget(self.log_box, 0, 4, 5, 1)
+
+        # Give the plot's rows/columns the stretch priority so extra space on
+        # resize goes to the plot, not the label/button rows around it. Without
+        # this the grid distributes space roughly evenly and the plot ends up
+        # not growing (or growing unevenly) when the window is resized.
+        layout.setRowStretch(0, 0)   # status/data labels
+        layout.setRowStretch(1, 1)   # plot
+        layout.setRowStretch(2, 1)   # plot
+        layout.setRowStretch(3, 0)   # peak-finder inputs
+        layout.setRowStretch(4, 0)   # buttons
+
+        layout.setColumnStretch(0, 1)
+        layout.setColumnStretch(1, 1)
+        layout.setColumnStretch(2, 1)
+        layout.setColumnStretch(3, 1)
+        layout.setColumnStretch(4, 0)   # log panel stays a fixed width
 
     def gain_popup(self):
         """Prompt user to enter picam gain"""
@@ -733,6 +793,7 @@ class specGUI(QMainWindow):
         self.pi_worker.finished.connect(self.pi_thread.quit)
         self.pi_thread.finished.connect(self.pi_worker.deleteLater)
         self.pi_thread.finished.connect(self.pi_thread.deleteLater)
+        self.pi_thread.finished.connect(self._on_thread_finished)
 
         self.pi_thread.start()
 
@@ -742,6 +803,12 @@ class specGUI(QMainWindow):
         self.pi_worker.provide_gain(gain)
 
     def _on_connect_finished(self, ok):
+        # Stop routing PiSerial's logging through the worker's signal - the
+        # worker is about to be scheduled for deletion, and any later call
+        # to self.pi.log(...) (e.g. from read_data's error-recovery path)
+        # would otherwise emit on a deleted QObject and crash.
+        self.pi.log = self.log_box.add_message
+
         if ok:
             self.status_label.setText("Status: Pi streaming - press Start Reading")
             self.status_label.setStyleSheet("color: green; font-size: 14px;")
@@ -749,6 +816,13 @@ class specGUI(QMainWindow):
         else:
             self.status_label.setText("Status: handshake failed")
             self.status_label.setStyleSheet("color: red; font-size: 14px;")
+
+    def _on_thread_finished(self):
+        # The thread/worker objects are queued for deletion (deleteLater) at
+        # this point - drop our Python references so nothing later touches
+        # the now-invalid C++ objects (e.g. closeEvent's isRunning() check).
+        self.pi_thread = None
+        self.pi_worker = None
 
     def start_loop(self):
         if self.serial_timer.isActive():
@@ -780,6 +854,7 @@ class specGUI(QMainWindow):
 
     def pfinder(self):
         self.pfind_state = not self.pfind_state
+        self.peak_settings_box.setVisible(self.pfind_state)
         if self.pfind_state:
             self.peakfind_btn.setText("Disable peak finder")
             self.peakfind_btn.setStyleSheet("background-color: #0078d4; color: white; padding: 8px;")
@@ -865,6 +940,16 @@ class specGUI(QMainWindow):
         self.mindist_box.clear()
         self.mindist_box.setPlaceholderText(f"MinDist is {self.live_plotter._mindist}")
         self.log_box.add_message(f"Mindist changed to {self.live_plotter._mindist}")
+
+    def handle_height(self):
+        try:
+            self.live_plotter._height = float(self.height_box.text())
+        except ValueError:
+            self.log_box.add_message('Height must be a number')
+            return
+        self.height_box.clear()
+        self.height_box.setPlaceholderText(f"Height is {self.live_plotter._height}")
+        self.log_box.add_message(f"Height changed to {self.live_plotter._height}")
 
     def on_hover(self, event):
         if event.inaxes == self.live_plotter.ax:
